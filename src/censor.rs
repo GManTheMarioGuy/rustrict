@@ -1,59 +1,81 @@
-use crate::banned::BANNED;
 use crate::buffer_proxy_iterator::BufferProxyIterator;
+use crate::feature_cell::FeatureCell;
 use crate::mtch::*;
-use crate::replacements::REPLACEMENTS;
 use crate::trie::*;
-use crate::Set;
-use crate::{is_whitespace, Replacements, Type};
+use crate::{is_whitespace, Type};
+use crate::{Map, Set};
+use lazy_static::lazy_static;
 use std::iter::Filter;
 use std::mem;
-use std::ops::Deref;
-use std::ops::RangeInclusive;
 use std::str::Chars;
 use unicode_normalization::{Decompositions, Recompositions, UnicodeNormalization};
+
+lazy_static! {
+    static ref TRIE: FeatureCell<Trie> = FeatureCell::new(
+        include_str!("profanity.csv")
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let mut split = line.split(',');
+                (
+                    split.next().unwrap(),
+                    Type::from_weights(
+                        &[0; Type::WEIGHT_COUNT].map(|_| split.next().unwrap().parse().unwrap()),
+                    ),
+                )
+            })
+            .chain(
+                include_str!("safe.txt")
+                    .lines()
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(|line| { (line, Type::SAFE) })
+            )
+            .chain(
+                include_str!("false_positives.txt")
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(|line| { (line, Type::NONE) })
+            )
+            .collect()
+    );
+    static ref REPLACEMENTS: Map<char, &'static str> = include_str!("replacements.csv")
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let comma = line.find(',').unwrap();
+            (line[..comma].chars().next().unwrap(), &line[comma + 1..])
+        })
+        .collect();
+    static ref BANNED: FeatureCell<Set<char>> = FeatureCell::new(
+        include_str!("banned_chars.txt")
+            .lines()
+            .filter(|s| s.starts_with("U+"))
+            .map(|s| {
+                u32::from_str_radix(&s[2..], 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap()
+            })
+            .collect()
+    );
+}
 
 /// Censor is a flexible profanity filter that can analyze and/or censor arbitrary text.
 ///
 /// You can also make use of `Censor` via traits `CensorStr` and `CensorIter`, which allow inline
 /// checking and censoring of `&str` and `Iterator<Item = char>` respectively.
 pub struct Censor<I: Iterator<Item = char>> {
-    /// A buffer of the input that stores unconfirmed characters (may need to censor before flushing).
-    /// This is so the censored output is unaffected by the subsequent iterator machinery.
-    buffer: BufferProxyIterator<Recompositions<Filter<Decompositions<I>, fn(&char) -> bool>>>,
-    options: Options,
-    inline: InlineState,
-    allocated: AllocatedState,
-}
-
-struct Options {
-    trie: &'static Trie,
-    replacements: &'static Replacements,
-    //banned: &'static Banned,
+    /// Options
     ignore_false_positives: bool,
     ignore_self_censoring: bool,
     censor_first_character_threshold: Type,
     //preserve_accents: bool,
     censor_replacement: char,
     censor_threshold: Type,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            trie: &*TRIE,
-            replacements: &*REPLACEMENTS,
-            //banned: &*BANNED,
-            ignore_false_positives: false,
-            ignore_self_censoring: false,
-            censor_first_character_threshold: Type::OFFENSIVE & Type::SEVERE,
-            //preserve_accents: false,
-            censor_replacement: '*',
-            censor_threshold: Default::default(),
-        }
-    }
-}
-
-struct InlineState {
+    /// Where potential matches are kept between calls to Self::next.
+    matches: Set<Match>,
+    /// Where potential matches are temporarily shuffled. Only allocate this once.
+    matches_tmp: Set<Match>,
     /// Whether the last character can be considered a separator.
     separate: bool,
     /// The last position matched against.
@@ -76,15 +98,35 @@ struct InlineState {
     total_matches: usize,
     #[cfg(any(feature = "find_false_positives", feature = "trace"))]
     total_match_characters: usize,
+    /// Where matches are kept after they are complete but may be cancelled due to false positives.
+    pending_commit: Vec<Match>,
+    /// A buffer of the input that stores unconfirmed characters (may need to censor before flushing).
+    /// This is so the censored output is unaffected by the subsequent iterator machinery.
+    buffer: BufferProxyIterator<Recompositions<Filter<Decompositions<I>, fn(&char) -> bool>>>,
     /// Whether already appended a space at the end.
     space_appended: bool,
     /// Whether all processing of characters has completed.
     done: bool,
 }
 
-impl Default for InlineState {
-    fn default() -> Self {
+impl<'a> Censor<Chars<'a>> {
+    /// Creates a `Censor` from a `&str`, ready to censor or analyze it.
+    pub fn from_str(s: &'a str) -> Self {
+        Self::new(s.chars())
+    }
+}
+
+impl<I: Iterator<Item = char>> Censor<I> {
+    /// Allocates a new `Censor` for analyzing and/or censoring text.
+    pub fn new(text: I) -> Self {
         Self {
+            // Default options
+            ignore_false_positives: false,
+            ignore_self_censoring: false,
+            censor_first_character_threshold: Type::OFFENSIVE & Type::SEVERE,
+            //preserve_accents: false,
+            censor_replacement: '*',
+            censor_threshold: Default::default(),
             // The beginning of the sequence is a separator.
             separate: true,
             // Nothing was detected yet.
@@ -105,54 +147,10 @@ impl Default for InlineState {
             total_matches: 0,
             #[cfg(any(feature = "find_false_positives", feature = "trace"))]
             total_match_characters: 0,
-        }
-    }
-}
-
-#[derive(Default)]
-struct AllocatedState {
-    /// Where potential matches are kept between calls to Self::next.
-    matches: Set<Match>,
-    /// Where potential matches are temporarily shuffled. Only allocate this once.
-    matches_tmp: Set<Match>,
-    /// Where matches are kept after they are complete but may be cancelled due to false positives.
-    pending_commit: Vec<Match>,
-    #[cfg(feature = "trace_full")]
-    detections: crate::Map<String, usize>,
-}
-
-impl AllocatedState {
-    fn clear(&mut self) {
-        let Self {
-            matches,
-            matches_tmp,
-            pending_commit,
-            #[cfg(feature = "trace_full")]
-            detections,
-        } = self;
-        matches.clear();
-        matches_tmp.clear();
-        pending_commit.clear();
-        #[cfg(feature = "trace_full")]
-        detections.clear();
-    }
-}
-
-impl<'a> Censor<Chars<'a>> {
-    /// Creates a `Censor` from a `&str`, ready to censor or analyze it.
-    pub fn from_str(s: &'a str) -> Self {
-        Self::new(s.chars())
-    }
-}
-
-impl<I: Iterator<Item = char>> Censor<I> {
-    /// Allocates a new `Censor` for analyzing and/or censoring text.
-    pub fn new(text: I) -> Self {
-        Self {
+            matches: Set::default(),
+            matches_tmp: Set::default(),
+            pending_commit: Vec::new(),
             buffer: Self::buffer_from(text),
-            options: Default::default(),
-            inline: Default::default(),
-            allocated: Default::default(),
         }
     }
 
@@ -169,7 +167,7 @@ impl<I: Iterator<Item = char>> Censor<I> {
                 MinorCategory::Cn | MinorCategory::Co | MinorCategory::Mn
             );
 
-            !(nok || BANNED.deref().deref().contains(*c))
+            !(nok || BANNED.contains(c))
         }
 
         BufferProxyIterator::new(
@@ -183,22 +181,29 @@ impl<I: Iterator<Item = char>> Censor<I> {
 
     /// Resets the `Censor` with new text. Does not change any configured options.
     /// This avoids reallocation of internal buffers on the heap.
+    ///
+    /// TODO: This is untested.
+    #[cfg(feature = "reset_censor")]
     pub fn reset(&mut self, text: I) {
-        self.inline = Default::default();
-        self.allocated.clear();
+        self.separate = true;
+        self.typ = Type::NONE;
+        self.uppercase = 0;
+        self.last = None;
+        self.repetitions = 0;
+        self.gibberish = 0;
+        self.replacements = 0;
+        self.self_censoring = 0;
+        self.space_appended = false;
+        self.done = false;
+        self.last_pos = usize::MAX;
+        #[cfg(any(feature = "find_false_positives", feature = "trace"))]
+        self.total_matches = 0;
+        #[cfg(any(feature = "find_false_positives", feature = "trace"))]
+        self.total_match_characters = 0;
+        self.matches.clear();
+        self.matches_tmp.clear();
+        self.pending_commit.clear();
         self.buffer = Self::buffer_from(text);
-    }
-
-    /// Replaces the trie containing profanity, false positives, and safe words.
-    pub fn with_trie(&mut self, trie: &'static Trie) -> &mut Self {
-        self.options.trie = trie;
-        self
-    }
-
-    /// Replaces the set of character replacements.
-    pub fn with_replacements(&mut self, replacements: &'static Replacements) -> &mut Self {
-        self.options.replacements = replacements;
-        self
     }
 
     /// Selects a threshold to apply while censoring. Only words that meet or exceed the threshold
@@ -206,9 +211,9 @@ impl<I: Iterator<Item = char>> Censor<I> {
     ///
     /// At present, [`Type::SPAM`] cannot be censored.
     ///
-    /// The default is [`Type::INAPPROPRIATE`].
+    /// The default is [`Type::Inappropriate`].
     pub fn with_censor_threshold(&mut self, censor_threshold: Type) -> &mut Self {
-        self.options.censor_threshold = censor_threshold;
+        self.censor_threshold = censor_threshold;
         self
     }
 
@@ -217,7 +222,7 @@ impl<I: Iterator<Item = char>> Censor<I> {
     ///
     /// The default is `false`.
     pub fn with_ignore_false_positives(&mut self, ignore_false_positives: bool) -> &mut Self {
-        self.options.ignore_false_positives = ignore_false_positives;
+        self.ignore_false_positives = ignore_false_positives;
         self
     }
 
@@ -231,7 +236,7 @@ impl<I: Iterator<Item = char>> Censor<I> {
     ///
     /// The default is `false`.
     pub fn with_ignore_self_censoring(&mut self, ignore_self_censoring: bool) -> &mut Self {
-        self.options.ignore_self_censoring = ignore_self_censoring;
+        self.ignore_self_censoring = ignore_self_censoring;
         self
     }
 
@@ -243,7 +248,7 @@ impl<I: Iterator<Item = char>> Censor<I> {
         &mut self,
         censor_first_character_threshold: Type,
     ) -> &mut Self {
-        self.options.censor_first_character_threshold = censor_first_character_threshold;
+        self.censor_first_character_threshold = censor_first_character_threshold;
         self
     }
 
@@ -252,7 +257,7 @@ impl<I: Iterator<Item = char>> Censor<I> {
     ///
     /// The default is false.
     pub fn with_preserve_accents(&mut self, preserve_accents: bool) {
-        self.options.preserve_accents = preserve_accents;
+        self.preserve_accents = preserve_accents;
     }
      */
 
@@ -260,14 +265,14 @@ impl<I: Iterator<Item = char>> Censor<I> {
     ///
     /// The default is `'*'`.
     pub fn with_censor_replacement(&mut self, censor_replacement: char) -> &mut Self {
-        self.options.censor_replacement = censor_replacement;
+        self.censor_replacement = censor_replacement;
         self
     }
 
     /// Useful for processing sub-slices of profanity.
     #[cfg(feature = "find_false_positives")]
     pub fn with_separate(&mut self, separate: bool) -> &mut Self {
-        self.inline.separate = separate;
+        self.separate = separate;
         self
     }
 
@@ -298,7 +303,7 @@ impl<I: Iterator<Item = char>> Censor<I> {
         self.analysis()
     }
 
-    /// Equivalent to `censor` and `analyze`, but in one pass through the input.
+    /// See the documentation of censor and analyze.
     pub fn censor_and_analyze(&mut self) -> (String, Type) {
         // It is important that censor is called first, so that the input is processed.
         let censored = self.censor();
@@ -308,71 +313,57 @@ impl<I: Iterator<Item = char>> Censor<I> {
 
     /// Converts internal weights to a `Type`.
     fn analysis(&self) -> Type {
-        self.inline.typ | self.safe_self_censoring_and_spam_detection()
+        self.typ | self.safe_self_censoring_and_spam_detection()
     }
 
     #[cfg(any(feature = "find_false_positives", feature = "trace"))]
     pub fn match_ptrs(&self) -> usize {
-        self.inline.match_ptrs
+        self.match_ptrs
     }
 
     #[cfg(any(feature = "find_false_positives", feature = "trace"))]
     pub fn total_matches(&self) -> usize {
-        self.inline.total_matches
+        self.total_matches
     }
 
     #[cfg(any(feature = "find_false_positives", feature = "trace"))]
     pub fn total_match_characters(&self) -> usize {
-        self.inline.total_match_characters
-    }
-
-    #[cfg(feature = "trace_full")]
-    pub fn detections(&self) -> &crate::Map<String, usize> {
-        &self.allocated.detections
+        self.total_match_characters
     }
 
     fn ensure_done(&mut self) {
-        if !self.inline.done {
+        if !self.done {
             for _ in self {}
         }
     }
 
     fn safe_self_censoring_and_spam_detection(&self) -> Type {
-        let safe = if self.inline.safe && self.inline.repetitions < 4 {
-            Type::SAFE
-        } else {
-            Type::NONE
-        };
+        let safe = if self.safe { Type::SAFE } else { Type::NONE };
 
-        if self.inline.last_pos < 6 {
+        if self.last_pos < 6 {
             // Short strings consisting of a single acronym are problematic percentage-wise.
             return safe;
         }
 
         // Total opportunities for spam and self censoring. A bias is added so that a few words in a
         // relatively short string won't create massive percentages.
-        let total = self
-            .inline
-            .last_pos
-            .saturating_add(6)
-            .min(u16::MAX as usize) as u16;
+        let total = self.last_pos.saturating_add(6).min(u16::MAX as usize) as u16;
 
         // Total spam.
         let spam = self
-            .inline
             .uppercase
-            .max(self.inline.repetitions)
-            .max(self.inline.gibberish / 2)
-            .max(self.inline.replacements) as u16;
+            .max(self.repetitions)
+            .max(self.gibberish / 2)
+            .max(self.replacements) as u16;
 
         // Calculate percents.
         let percent_spam = 100 * spam / total;
-        let percent_self_censoring = 100 * self.inline.self_censoring as u16 / total;
+        let percent_self_censoring = 100 * self.self_censoring as u16 / total;
 
         // Assess amount of spam.
-        let spam = if percent_spam >= 70 && self.inline.last_pos >= 20 {
+        let spam = if percent_spam >= 70 && self.last_pos >= 20 {
             Type::SPAM & Type::SEVERE
-        } else if percent_spam >= 50 && self.inline.last_pos >= 10 {
+        } else if percent_spam >= 50 && self.last_pos >= 10 {
             Type::SPAM & Type::MODERATE
         } else if percent_spam >= 30 {
             Type::SPAM & Type::MILD
@@ -381,7 +372,7 @@ impl<I: Iterator<Item = char>> Censor<I> {
         };
 
         // Assess amount of self-censoring.
-        let self_censoring = if !self.options.ignore_self_censoring && percent_self_censoring > 20 {
+        let self_censoring = if !self.ignore_self_censoring && percent_self_censoring > 20 {
             Type::PROFANE & Type::MILD
         } else {
             Type::NONE
@@ -397,27 +388,38 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
     /// Retrieves the next (potentially censored) character.
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(raw_c) = self.buffer.next().or_else(|| {
-            if self.inline.space_appended {
+            if self.space_appended {
                 None
             } else {
-                self.inline.space_appended = true;
+                self.space_appended = true;
                 Some(' ')
             }
         }) {
-            if !self.inline.space_appended && raw_c != '!' && raw_c != '.' && raw_c != '?' {
+            if !self.space_appended && raw_c != '!' && raw_c != '.' && raw_c != '?' {
                 // The input is not over yet, so any previous notion of safety is irrelevant.
-                self.inline.safe = false;
+                self.safe = false;
             }
 
             let pos = self.buffer.index();
 
-            self.inline.uppercase = self
-                .inline
-                .uppercase
-                .saturating_add(raw_c.is_uppercase() as u8);
+            self.uppercase = self.uppercase.saturating_add(raw_c.is_uppercase() as u8);
+            /*
+            // Very old whitelist (allows a ton of abuse):
+            let skippable = match c {
+                ' ' | '~' | '-' | '−' | '_' | '.' | '!' | '?' | ',' | '*' | '"' | '\'' | '\n' | '\r'
+                | '\t' => true,
+                _ => false,
+            };
 
-            let skippable = !raw_c.is_alphabetic() || is_whitespace(raw_c);
-            let replacement = self.options.replacements.get(raw_c);
+            // More recent whitelist (still allows abuse like f^u^c^k):
+            let skippable = raw_c.is_punctuation()
+                || raw_c.is_separator()
+                || is_whitespace(raw_c)
+                || matches!(raw_c, '(' | ')');
+            // Use a blacklist instead:
+             */
+            let skippable = !raw_c.is_alphanumeric() || is_whitespace(raw_c);
+            let replacement = REPLACEMENTS.get(&raw_c);
 
             #[cfg(feature = "trace")]
             println!(
@@ -425,18 +427,16 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
                 raw_c, skippable, replacement
             );
 
-            const BLOCK_ELEMENTS: RangeInclusive<char> = '\u{2580}'..='\u{259F}';
-
-            if (!self.inline.separate || self.inline.last == Some(self.options.censor_replacement))
-                && (raw_c == self.options.censor_replacement || BLOCK_ELEMENTS.contains(&raw_c))
+            if (!self.separate || self.last == Some(self.censor_replacement))
+                && raw_c == self.censor_replacement
             {
                 // Censor replacement found but not beginning of word.
-                self.inline.self_censoring = self.inline.self_censoring.saturating_add(1);
+                self.self_censoring = self.self_censoring.saturating_add(1);
             }
 
-            if let Some(last) = self.inline.last {
+            if let Some(last) = self.last {
                 if raw_c == last {
-                    self.inline.repetitions = self.inline.repetitions.saturating_add(1);
+                    self.repetitions = self.repetitions.saturating_add(1);
                 }
 
                 // Characters on the home-row of a QWERTY keyboard.
@@ -446,7 +446,7 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
 
                 // Single gibberish characters don't count. Must have been preceded by another gibberish character.
                 if is_gibberish(raw_c) && is_gibberish(last) {
-                    self.inline.gibberish = self.inline.gibberish.saturating_add(1);
+                    self.gibberish = self.gibberish.saturating_add(1);
                 }
             }
 
@@ -455,39 +455,31 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
                 // a profanity, so that these profanities are detected.
                 //
                 // Not adding a match is mainly an optimization.
-                if !(skippable
-                    && replacement.is_none()
-                    && !self.options.trie.root.children.contains_key(&raw_c))
-                {
+                if !(skippable && replacement.is_none() && !matches!(raw_c, ' ' | '_' | '🖕')) {
                     let begin_camel_case_word = raw_c.is_ascii_uppercase()
-                        && self
-                            .inline
-                            .last
-                            .map(|c| !c.is_ascii_uppercase())
-                            .unwrap_or(false);
+                        && self.last.map(|c| !c.is_ascii_uppercase()).unwrap_or(false);
 
                     // Seed a new match for every character read.
-                    self.allocated.matches.insert(Match {
-                        node: &self.options.trie.root,
+                    self.matches.insert(Match {
+                        node: &TRIE.root,
                         start: pos, // will immediately be incremented if match is kept.
                         end: usize::MAX, // sentinel.
                         last: 0 as char, // sentinel.
-                        begin_separate: self.inline.separate || begin_camel_case_word,
+                        begin_separate: self.separate || begin_camel_case_word,
                         end_separate: false, // unknown at this time.
                         spaces: 0,
                         skipped: 0,
                         replacements: 0,
-                        repetitions: 0,
                         low_confidence_replacements: 0,
                     });
                 }
             }
 
-            self.inline.separate = skippable;
+            self.separate = skippable;
 
-            if self.inline.separate {
-                for pending in self.allocated.pending_commit.iter_mut() {
-                    if pending.end == self.inline.last_pos {
+            if self.separate {
+                for pending in self.pending_commit.iter_mut() {
+                    if pending.end == self.last_pos {
                         pending.end_separate = true;
                     }
                 }
@@ -498,28 +490,23 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
             let mut replacement_counted = false;
             let raw_c_lower = raw_c.to_lowercase().next().unwrap();
 
-            mem::swap(&mut self.allocated.matches, &mut self.allocated.matches_tmp);
+            mem::swap(&mut self.matches, &mut self.matches_tmp);
             for c in replacement
-                .map(|a| a.as_str())
                 .unwrap_or(&&*raw_c.encode_utf8(&mut [0; 4]))
                 .chars()
             {
                 // This replacement (uppercase to lower case) raises absolutely zero suspicion.
-                let benign_replacement = c == raw_c || c == raw_c_lower;
+                let benign_replacement = c == raw_c_lower;
 
                 // This counts as a replacement, mainly for spam detection purposes.
                 let countable_replacement = !(replacement_counted
                     || benign_replacement
                     || raw_c.is_ascii_alphabetic()
                     || (raw_c.is_ascii_digit()
-                        && self
-                            .inline
-                            .last
-                            .map(|l| l.is_ascii_digit())
-                            .unwrap_or(false)));
+                        && self.last.map(|l| l.is_ascii_digit()).unwrap_or(false)));
 
                 if countable_replacement {
-                    self.inline.replacements = self.inline.replacements.saturating_add(1);
+                    self.replacements = self.replacements.saturating_add(1);
                     replacement_counted = true;
                 }
 
@@ -539,41 +526,35 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
                 // also, so "i'm fine" matches "im fine" for safety purposes.
                 let ignore_sep = matches!(c, '-' | '\'' | '\n' | '\r');
 
-                for m in self.allocated.matches_tmp.iter() {
+                for m in self.matches_tmp.iter() {
                     let m = m.clone();
-
-                    if m.low_confidence_replacements > 5
-                        || m.skipped > 5
-                        || (m.node.word && m.repetitions > 20)
-                    {
-                        #[cfg(feature = "trace")]
-                        println!("throwing out low confidence match: \"{}\"", m.node.trace);
-                        //continue;
-                    }
 
                     safety_end = safety_end.min(m.start);
 
                     #[cfg(feature = "trace")]
                     println!(
-                        "  - Consider match \"{}\" with spaces={}, replacements={}",
-                        m.node.trace, m.spaces, m.replacements
+                        "  - Consider match \"{}\" with spaces={}",
+                        m.node.trace, m.spaces
                     );
 
-                    if (skippable || c == m.last || Some(c) == m.node.last)
-                        && m.start != pos.unwrap_or(0)
-                    {
+                    if (skippable || c == m.last) && m.start != pos.unwrap_or(0) {
+                        // Undo remove.
+                        #[cfg(feature = "trace")]
+                        println!("undo remove \"{}\" where last={}, node last={:?} and initial spaces={}", m.node.trace, m.last, m.node.last, m.spaces);
+
                         // Here, '.' is primarily for allowing ellipsis ("...") as a form of
                         // space.
                         // ( and ) are for ignoring appositive phrases.
-                        // Checking node.last is to collapse multiple spaces into one
+                        // Checking node.last is to collapse multiple spaces into one, to avoid
                         let new_space = matches!(c, ' ' | '.' | ',' | ':' | ';' | '…' | '(' | ')')
+                            // && skippable
                             && m.node.last != Some(' ');
-                        let new_repetition: bool = !new_space && c == m.last;
-                        let new_skip = !new_space && skippable && !ignore_sep && !new_repetition;
-                        // dil -> dii
-                        let new_replacement = c == m.last && raw_c != c && !new_repetition;
+                        // && !ignore_sep;
+
+                        let new_skip = skippable && !ignore_sep;
+                        let new_replacement = !benign_replacement && !self.separate;
                         let new_low_confidence_replacement =
-                            new_replacement && raw_c.is_ascii_digit();
+                            !benign_replacement && raw_c.is_ascii_digit();
 
                         let undo_m = Match {
                             spaces: m.spaces.saturating_add(new_space as u8),
@@ -582,42 +563,37 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
                             low_confidence_replacements: m
                                 .low_confidence_replacements
                                 .saturating_add(new_low_confidence_replacement as u8),
-                            repetitions: m.repetitions.saturating_add(new_repetition as u8),
-                            last: c,
                             ..m
                         };
-                        #[cfg(feature = "trace")]
-                        println!("    (keep with last={}, node last={:?}, spaces={}, skip={}, repl={}, repet={})", undo_m.last, undo_m.node.last, undo_m.spaces, undo_m.skipped, undo_m.replacements, undo_m.repetitions);
-
-                        if let Some(existing) = self.allocated.matches.get(&undo_m) {
+                        if let Some(existing) = self.matches.get(&undo_m) {
                             let replacement = existing.combine(&undo_m);
-                            self.allocated.matches.replace(replacement);
+                            self.matches.replace(replacement);
                         } else {
-                            self.allocated.matches.insert(undo_m);
+                            self.matches.insert(undo_m);
                         }
                     }
 
                     if let Some(next) = m.node.children.get(&c) {
-                        let new_replacement = !benign_replacement && (c != raw_c) && c != ' ';
-                        let new_low_confidence_replacement =
-                            new_replacement && raw_c.is_ascii_digit();
-                        let new_space =
-                            !new_replacement && (raw_c != c && self.inline.separate && c != '\'');
-
                         let next_m = Match {
                             node: next,
-                            spaces: m.spaces.saturating_add(new_space as u8),
-                            replacements: m.replacements.saturating_add(new_replacement as u8),
+                            spaces: m
+                                .spaces
+                                .saturating_add((c != raw_c && self.separate && c != '\'') as u8),
+                            replacements: m
+                                .replacements
+                                .saturating_add((!benign_replacement && !self.separate) as u8),
                             low_confidence_replacements: m
                                 .low_confidence_replacements
-                                .saturating_add(new_low_confidence_replacement as u8),
+                                .saturating_add(
+                                    (!benign_replacement && raw_c.is_ascii_digit()) as u8,
+                                ),
                             last: c,
                             ..m
                         };
 
                         #[cfg(feature = "trace")]
                         println!(
-                            "     - Next is \"{}\", with spaces={}, replacements={}",
+                            "     - Next is \"{}\", with spaces={}, replacements = {}",
                             next.trace, next_m.spaces, next_m.replacements
                         );
 
@@ -626,19 +602,17 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
                                 && next_m.start == 0
                                 && next_m.spaces == 0
                                 && next_m.skipped == 0
-                                && next_m.replacements == 0
-                                && !self.options.ignore_false_positives
+                                && !self.ignore_false_positives
                             {
                                 // Everything in the input until now is safe.
                                 #[cfg(feature = "trace")]
                                 println!("found safe word: {}", next_m.node.trace);
-                                self.inline.safe = true;
+                                self.safe = true;
                             }
 
-                            /*
                             #[cfg(feature = "trace")]
                             if !next_m.node.typ.is(Type::ANY) {
-                                if self.options.ignore_false_positives {
+                                if self.ignore_false_positives {
                                     print!("ignoring");
                                 } else {
                                     print!("found");
@@ -648,18 +622,16 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
                                     next_m.node.trace, next_m.spaces, next_m.skipped, next_m.replacements
                                 );
                             }
-                            */
 
                             if next_m.node.typ.is(Type::ANY) {
-                                self.allocated.pending_commit.push(Match {
+                                self.pending_commit.push(Match {
                                     end: pos.unwrap(),
                                     ..next_m
                                 });
                             } else if next_m.spaces == 0
                                 && next_m.skipped == 0
                                 && next_m.replacements == 0
-                                && next_m.repetitions == 0 // as se
-                                && !self.options.ignore_false_positives
+                                && !self.ignore_false_positives
                             {
                                 // Is false positive, so invalidate internal matches.
                                 #[cfg(feature = "trace")]
@@ -672,29 +644,34 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
                             }
                         }
 
-                        if let Some(existing) = self.allocated.matches.get(&next_m) {
+                        if let Some(existing) = self.matches.get(&next_m) {
                             let replacement = existing.combine(&next_m);
-                            self.allocated.matches.replace(replacement);
+                            self.matches.replace(replacement);
                         } else {
-                            self.allocated.matches.insert(next_m);
+                            self.matches.insert(next_m);
                         }
                     }
                 }
             }
-            self.allocated.matches_tmp.clear();
-            self.inline.last = Some(raw_c);
+            self.matches_tmp.clear();
+            self.last = Some(raw_c);
             if let Some(pos) = pos {
-                self.inline.last_pos = pos;
+                self.last_pos = pos;
             }
 
+            let typ = &mut self.typ;
             let spy = &mut self.buffer;
-            let options = &self.options;
-            let inline = &mut self.inline;
-            let pending_commit = &mut self.allocated.pending_commit;
-            #[cfg(feature = "trace_full")]
-            let detections = &mut self.allocated.detections;
+            let censor_threshold = self.censor_threshold;
+            let censor_first_character_threshold = self.censor_first_character_threshold;
+            let censor_replacement = self.censor_replacement;
+            #[cfg(any(feature = "find_false_positives", feature = "trace"))]
+            let first_match_ptr = &mut self.match_ptrs;
+            #[cfg(any(feature = "find_false_positives", feature = "trace"))]
+            let total_matches = &mut self.total_matches;
+            #[cfg(any(feature = "find_false_positives", feature = "trace"))]
+            let total_match_characters = &mut self.total_match_characters;
 
-            pending_commit.retain(|pending| {
+            self.pending_commit.retain(|pending| {
                 #[cfg(feature = "trace")]
                 println!("Consider whether to cancel pending commit {} with start={} against drain_start={:?}", pending.node.trace, pending.start, drain_start);
 
@@ -710,21 +687,17 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
                 // Can pre-commit due to lack of false positive matches.
                 if pending.end < safety_end {
                     if pending.commit(
-                        &mut inline.typ,
+                        typ,
                         spy,
-                        options.censor_threshold,
-                        options.censor_first_character_threshold,
-                        options.censor_replacement,
+                        censor_threshold,
+                        censor_first_character_threshold,
+                        censor_replacement,
                     ) {
                         #[cfg(any(feature = "find_false_positives", feature = "trace"))]
                         {
-                            inline.match_ptrs ^= pending.node as *const _ as usize;
-                            inline.total_matches += 1;
-                            inline.total_match_characters += pending.end - pending.start;
-                            #[cfg(feature = "trace_full")]
-                            {
-                                *detections.entry(pending.node.trace.clone()).or_default() += 1;
-                            }
+                            *first_match_ptr ^= pending.node as *const _ as usize;
+                            *total_matches += 1;
+                            *total_match_characters += pending.end - pending.start;
                         }
                     }
                     return false;
@@ -741,7 +714,7 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
                 let mut safe_until = spy_next_index < safety_end;
 
                 // This covers all pending commit matches.
-                for pending in &self.allocated.pending_commit {
+                for pending in &self.pending_commit {
                     if pending.start <= spy_next_index {
                         safe_until = false;
                         break;
@@ -753,32 +726,24 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
             }
         }
 
-        let residual = mem::take(&mut self.allocated.pending_commit);
+        let residual = mem::take(&mut self.pending_commit);
         #[cfg(feature = "trace")]
         if !residual.is_empty() {
             println!("{} residuals", residual.len());
         }
         for pending in residual {
             if pending.commit(
-                &mut self.inline.typ,
+                &mut self.typ,
                 &mut self.buffer,
-                self.options.censor_threshold,
-                self.options.censor_first_character_threshold,
-                self.options.censor_replacement,
+                self.censor_threshold,
+                self.censor_first_character_threshold,
+                self.censor_replacement,
             ) {
                 #[cfg(any(feature = "find_false_positives", feature = "trace"))]
                 {
-                    self.inline.match_ptrs ^= pending.node as *const _ as usize;
-                    self.inline.total_matches += 1;
-                    self.inline.total_match_characters += pending.end - pending.start;
-                    #[cfg(feature = "trace_full")]
-                    {
-                        *self
-                            .allocated
-                            .detections
-                            .entry(pending.node.trace.clone())
-                            .or_default() += 1;
-                    }
+                    self.match_ptrs ^= pending.node as *const _ as usize;
+                    self.total_matches += 1;
+                    self.total_match_characters += pending.end - pending.start;
                 }
             }
         }
@@ -787,7 +752,7 @@ impl<I: Iterator<Item = char>> Iterator for Censor<I> {
             return Some(c);
         }
 
-        self.inline.done = true;
+        self.done = true;
 
         None
     }
@@ -868,8 +833,6 @@ pub(crate) fn should_skip_censor(string: &str) -> bool {
 /// It is recommended to use all lower-case, which will match both cases. Upper-case characters will
 /// only match upper-case.
 ///
-/// Prefer the safe API `Censor::with_trie`, using a modified `Trie::default()`.
-///
 /// # Warning
 ///
 /// Any profanity words added this way will not support false positives. For example, if you add the word
@@ -880,9 +843,8 @@ pub(crate) fn should_skip_censor(string: &str) -> bool {
 /// This must not be called when the crate is being used in any other way. It is best to call this
 /// from the main thread, near the beginning of the program.
 #[cfg(feature = "customize")]
-#[deprecated = "Use the equivalent Trie::customize_default().set(word, typ) or the safe API Censor::with_trie"]
 pub unsafe fn add_word(word: &str, typ: Type) {
-    Trie::customize_default().set(word, typ)
+    TRIE.get_mut().add(word, typ, true);
 }
 
 #[cfg(test)]
@@ -891,7 +853,7 @@ mod tests {
 
     extern crate test;
     use crate::censor::should_skip_censor;
-    use crate::{Censor, CensorIter, CensorStr, Trie, Type};
+    use crate::{Censor, CensorIter, CensorStr, Type};
     use bitflags::_core::ops::Not;
     use rand::prelude::ThreadRng;
     use rand::{thread_rng, Rng};
@@ -987,6 +949,13 @@ mod tests {
 
     #[test]
     #[serial]
+    fn issue_1() {
+        // https://github.com/finnbear/rustrict/issues/1#issuecomment-1024426326
+        assert!("I could say I miss you but it’s not the truth".isnt(Type::ANY));
+    }
+
+    #[test]
+    #[serial]
     fn curated() {
         let mut cases: Vec<(&str, bool, Option<bool>)> = vec![("", false, Some(false))];
         cases.extend(
@@ -1014,8 +983,6 @@ mod tests {
                 .map(|l| (l, false, Some(true))),
         );
 
-        let mut failures = Vec::new();
-
         for (case, any_truth, safe_truth) in cases {
             /*
             #[cfg(debug_assertions)]
@@ -1031,35 +998,25 @@ mod tests {
 
             if any != any_truth {
                 find_detection(case);
-                failures.push(format!("FAIL: Predicted {:?} for: \"{}\"", typ, case));
-            } else if !any_truth {
+                panic!("FAIL: Predicted {:?} for {}", typ, case);
+            }
+            if !any {
                 // None of the current test cases contain any abusive Unicode characters.
-                let censored = case.censor();
-                if case != censored {
-                    failures.push(format!("Censored: : \"{case}\" -> {censored}"))
-                }
+                assert_eq!(case, case.censor());
             }
             if let Some(safe_truth) = safe_truth {
                 if safe != safe_truth {
-                    failures.push(format!("FAIL: Predicted safe={} for: \"{}\"", safe, case));
+                    panic!("FAIL: Predicted safe={} for {}", safe, case);
                 }
             }
-        }
-
-        if !failures.is_empty() {
-            for failure in failures {
-                println!("{failure}");
-            }
-            panic!();
         }
     }
 
     #[test]
     #[serial]
     fn censor() {
-        let censored = Censor::from_str("HELLO fučk Shit nudes WORLD!")
+        let censored = Censor::from_str("HELLO fučk Shit nigga WORLD!")
             .with_censor_replacement('#')
-            .with_censor_first_character_threshold(Type::SEXUAL & Type::SEVERE)
             .censor();
 
         assert_eq!(censored, "HELLO f### S### ##### WORLD!");
@@ -1138,14 +1095,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn repetitions_non_safe() {
-        assert!("hello".is(Type::SAFE));
-        assert!("helllo".is(Type::SAFE));
-        assert!("hellllllllo".isnt(Type::SAFE));
-    }
-
-    #[test]
-    #[serial]
     #[cfg(not(debug_assertions))]
     fn accuracy() {
         fn rustrict(s: &str) -> bool {
@@ -1163,40 +1112,21 @@ mod tests {
             filter.check(s)
         }
 
-        let mut stfu_filter = stfu_crate::types::OwnedFilter::default();
-        use stfu_crate::word_lists::severity::{MILD, SEVERE, STRONG};
-        stfu_filter.add_slice(&MILD);
-        stfu_filter.add_slice(&STRONG);
-        stfu_filter.add_slice(&SEVERE);
-
-        let stfu = |s: &str| -> bool { stfu_filter.filter_string(s).is_some() };
-
-        fn profane_rs(s: &str) -> bool {
-            profane_rs_crate::contains_profanity(s, false)
-        }
-
         println!("| Crate | Accuracy | Positive Accuracy | Negative Accuracy | Time |");
         println!("|-------|----------|-------------------|-------------------|------|");
         print_accuracy(
             "https://crates.io/crates/rustrict",
             rustrict,
             false, // true,
-            Some(rustrict_old as fn(&str) -> bool).filter(|_| std::env::var("COMPARE").is_ok()),
+            None,  // Some(rustrict_old),
         );
         print_accuracy("https://crates.io/crates/censor", censor, false, None);
-        print_accuracy("https://crates.io/crates/stfu", stfu, false, None);
-        print_accuracy(
-            "https://crates.io/crates/profane-rs",
-            profane_rs,
-            false,
-            None,
-        );
     }
 
     #[allow(dead_code)]
     fn print_accuracy(
         link: &str,
-        checker: impl Fn(&str) -> bool,
+        checker: fn(&str) -> bool,
         find_detections: bool,
         compare_to: Option<fn(&str) -> bool>,
     ) {
@@ -1215,7 +1145,7 @@ mod tests {
 
     #[allow(dead_code)]
     fn accuracy_of(
-        checker: impl Fn(&str) -> bool,
+        checker: fn(&str) -> bool,
         find_detections: bool,
         compare_to: Option<fn(&str) -> bool>,
     ) -> (f32, f32, f32) {
@@ -1324,7 +1254,6 @@ mod tests {
     #[cfg(feature = "customize")]
     #[test]
     #[serial]
-    #[allow(deprecated)]
     fn customize() {
         use crate::add_word;
 
@@ -1348,25 +1277,6 @@ mod tests {
         }
 
         assert!(test_profanity.isnt(Type::PROFANE));
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    #[serial]
-    fn serde() {
-        let large = Trie::default();
-        let bc = bincode::serialize(&large).unwrap();
-        let json = serde_json::to_string(&large).unwrap();
-        println!("large bincode {}, large json {}", bc.len(), json.len());
-
-        let mut trie = Trie::new();
-        trie.set("squeak", Type::SPAM & Type::MILD);
-        trie.set("squirrel", Type::SAFE);
-
-        let bc = bincode::serialize(&trie).unwrap();
-        println!("smol bincode (len {}): {bc:?}", bc.len());
-        let json = serde_json::to_string(&trie).unwrap();
-        println!("smol json (len {}): {json}", json.len());
     }
 
     #[allow(soft_unstable)]

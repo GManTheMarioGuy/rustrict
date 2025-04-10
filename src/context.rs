@@ -8,24 +8,18 @@ use std::time::{Duration, Instant};
 
 /// Context is useful for taking moderation actions on a per-user basis i.e. each user would get
 /// their own Context.
-///
-/// # Recommendation
-///
-/// Use this as a reference implementation e.g. by copying and adapting it.
 #[derive(Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(doc, doc(cfg(feature = "context")))]
 pub struct Context {
-    history: VecDeque<(String, Time)>,
+    history: VecDeque<(String, Instant)>,
     burst_used: u8,
     suspicion: u8,
     reports: u8,
     total: u16,
     total_inappropriate: u16,
-    muted_until: Option<Time>,
-    only_safe_until: Option<Time>,
-    rate_limited_until: Option<Time>,
-    last_message: Option<Time>,
+    muted_until: Option<Instant>,
+    only_safe_until: Option<Instant>,
+    rate_limited_until: Option<Instant>,
+    last_message: Option<Instant>,
 }
 
 impl Debug for Context {
@@ -48,7 +42,6 @@ impl Debug for Context {
 /// Options for customizing `Context::process_with_options`. Always initialize with ..Default::default(),
 /// as new fields may be added in the future.
 #[derive(Clone, Debug)]
-#[cfg_attr(doc, doc(cfg(feature = "context")))]
 pub struct ContextProcessingOptions {
     /// Block messages if the user has been manually muted.
     pub block_if_muted: bool,
@@ -63,9 +56,6 @@ pub struct ContextProcessingOptions {
     ///
     /// Messages will be trimmed to fit.
     pub character_limit: Option<NonZeroUsize>,
-    /// Ensure word-break will work on the message.
-    #[cfg(feature = "width")]
-    pub word_break: Option<ContextWordBreakOptions>,
     /// Rate-limiting options.
     pub rate_limit: Option<ContextRateLimitOptions>,
     /// Block messages if they are very similar to this many previous message.
@@ -86,8 +76,6 @@ impl Default for ContextProcessingOptions {
             safe_mode_until: None,
             character_limit: Some(NonZeroUsize::new(2048).unwrap()),
             rate_limit: Some(ContextRateLimitOptions::default()),
-            #[cfg(feature = "width")]
-            word_break: Some(ContextWordBreakOptions::default()),
             repetition_limit: Some(ContextRepetitionLimitOptions::default()),
             max_safe_timeout: Duration::from_secs(30 * 60),
             trim_whitespace: true,
@@ -97,7 +85,6 @@ impl Default for ContextProcessingOptions {
 
 /// Options that control rate-limiting.
 #[derive(Clone, Debug)]
-#[cfg_attr(doc, doc(cfg(feature = "context")))]
 pub struct ContextRateLimitOptions {
     /// Minimum time between messages (zero means infinite rate, 2s means 0.5 messages per second).
     pub limit: Duration,
@@ -132,30 +119,8 @@ impl ContextRateLimitOptions {
     }
 }
 
-/// Options that ensure word break will be possible.
-#[derive(Clone, Debug)]
-#[cfg(feature = "width")]
-#[cfg_attr(doc, doc(cfg(all(feature = "context", feature = "width"))))]
-pub struct ContextWordBreakOptions {
-    /// The type of word-breaking used to display the text.
-    pub word_break: crate::width::WordBreak,
-    /// The maximum length of an unbreakable part (before the entire message is blocked).
-    pub limit: NonZeroUsize,
-}
-
-#[cfg(feature = "width")]
-impl Default for ContextWordBreakOptions {
-    fn default() -> Self {
-        Self {
-            word_break: crate::width::WordBreak::BreakAll,
-            limit: NonZeroUsize::new(16).unwrap(),
-        }
-    }
-}
-
 /// Options that control repetition-limiting.
 #[derive(Clone, Debug)]
-#[cfg_attr(doc, doc(cfg(feature = "context")))]
 pub struct ContextRepetitionLimitOptions {
     /// How many recent strings can be similar before blocking ensues.
     pub limit: u8,
@@ -193,13 +158,13 @@ impl Context {
 
     /// Returns None if expired is None or has been reached, resulting in expiry being set to None.
     /// Otherwise, returns duration before expiry.
-    fn remaining_duration(expiry: &mut Option<Time>, now: Instant) -> Option<Duration> {
+    fn remaining_duration(expiry: &mut Option<Instant>, now: Instant) -> Option<Duration> {
         if let Some(time) = *expiry {
-            if now >= time.0 {
+            if now >= time {
                 *expiry = None;
                 None
             } else {
-                Some(time.0 - now)
+                Some(time - now)
             }
         } else {
             None
@@ -222,10 +187,7 @@ impl Context {
         options: &ContextProcessingOptions,
     ) -> Result<String, BlockReason> {
         let now = Instant::now();
-        let elapsed = self
-            .last_message
-            .map(|l| now.saturating_duration_since(l.0))
-            .unwrap_or(Duration::ZERO);
+        let elapsed = self.last_message.map(|l| now - l).unwrap_or(Duration::ZERO);
 
         let suspicion = self.suspicion.max(1).saturating_mul(self.reports.max(1));
 
@@ -278,16 +240,6 @@ impl Context {
             censored_str = trim_whitespace(censored_str);
         }
 
-        #[cfg(feature = "width")]
-        {
-            if let Some(word_break) = &options.word_break {
-                let max = crate::width::width_str_max_unbroken(censored_str, word_break.word_break);
-                if max > word_break.limit.get() {
-                    return Err(BlockReason::Unbroken(max));
-                }
-            }
-        }
-
         if censored_str.len() < censored.len() {
             // Something was trimmed, must must re-allocate.
             censored = String::from(censored_str);
@@ -316,7 +268,7 @@ impl Context {
         let mut recent_similar = 0;
 
         if let Some(opts) = options.repetition_limit.as_ref() {
-            self.history.retain(|&(_, t)| now - t.0 < opts.memory);
+            self.history.retain(|&(_, t)| now - t < opts.memory);
 
             for (recent_message, _) in &self.history {
                 if strsim::normalized_levenshtein(recent_message, &message)
@@ -340,18 +292,16 @@ impl Context {
         if ((is_kinda_sus && new_suspicion >= 4) || (is_impostor && new_suspicion >= 2))
             && !options.max_safe_timeout.is_zero()
         {
-            if let Some(only_safe_until) = self
-                .only_safe_until
-                .map(|t| t.0)
-                .unwrap_or(now)
-                .checked_add(if self.reports > 0 {
-                    Duration::from_secs(10 * 60)
-                } else {
-                    Duration::from_secs(5 * 60)
-                })
+            if let Some(only_safe_until) =
+                self.only_safe_until
+                    .unwrap_or(now)
+                    .checked_add(if self.reports > 0 {
+                        Duration::from_secs(10 * 60)
+                    } else {
+                        Duration::from_secs(5 * 60)
+                    })
             {
-                self.only_safe_until =
-                    Some(Time(only_safe_until.min(now + options.max_safe_timeout)));
+                self.only_safe_until = Some(only_safe_until.min(now + options.max_safe_timeout));
             }
         }
 
@@ -399,7 +349,7 @@ impl Context {
                 targeted: true,
             })
         } else {
-            self.last_message = Some(Time(now));
+            self.last_message = Some(now);
             if let Some(rate_limit_options) = options.rate_limit.as_ref() {
                 // How many messages does this count for against the rate limit.
                 let rate_limit_messages =
@@ -422,15 +372,12 @@ impl Context {
                             .min(u8::MAX as u128) as u8,
                     )
                 };
-                if let Some(rate_limited_until) = self
-                    .rate_limited_until
-                    .map(|t| t.0)
-                    .unwrap_or(now)
-                    .checked_add(
+                if let Some(rate_limited_until) =
+                    self.rate_limited_until.unwrap_or(now).checked_add(
                         rate_limit_options.limit * (rate_limit_messages + new_suspicion) as u32,
                     )
                 {
-                    self.rate_limited_until = Some(Time(rate_limited_until));
+                    self.rate_limited_until = Some(rate_limited_until);
                 }
             }
             // Forgiveness (minus one suspicion per safe message, and also per minute between messages).
@@ -444,7 +391,7 @@ impl Context {
                     self.history.pop_front();
                 }
 
-                self.history.push_back((message, Time(now)));
+                self.history.push_back((message, now));
             }
 
             Ok(censored)
@@ -454,30 +401,25 @@ impl Context {
     /// Returns how long the user is muted for (possibly [`Duration::ZERO`]).
     pub fn muted_for(&self) -> Duration {
         self.muted_until
-            .map(|muted_until| muted_until.0.saturating_duration_since(Instant::now()))
+            .map(|muted_until| muted_until.saturating_duration_since(Instant::now()))
             .unwrap_or(Duration::ZERO)
-    }
-
-    /// Returns the instant of the last processed message.
-    pub fn last_message(&self) -> Option<Instant> {
-        self.last_message.map(|t| t.0)
     }
 
     /// Returns the latest instant the user is muted (possibly in the past).
     pub fn muted_until(&self) -> Option<Instant> {
-        self.muted_until.map(|t| t.0)
+        self.muted_until
     }
 
     /// Returns how long the user is restricted to [`Type::SAFE`] for (possibly [`Duration::ZERO`]).
     pub fn restricted_for(&self) -> Duration {
         self.only_safe_until
-            .map(|restricted_until| restricted_until.0.saturating_duration_since(Instant::now()))
+            .map(|restricted_until| restricted_until.saturating_duration_since(Instant::now()))
             .unwrap_or(Duration::ZERO)
     }
 
     /// Returns the latest instant the user is restricted (possibly in the past).
     pub fn restricted_until(&self) -> Option<Instant> {
-        self.only_safe_until.map(|t| t.0)
+        self.only_safe_until
     }
 
     /// Manually mute this user's messages for a duration. Overwrites any previous manual mute.
@@ -489,7 +431,7 @@ impl Context {
     /// Manually mute this user's messages until an instant. Overwrites any previous manual mute.
     /// Passing an instant in the past will therefore un-mute.
     pub fn mute_until(&mut self, instant: Instant) {
-        self.muted_until = Some(Time(instant));
+        self.muted_until = Some(instant);
     }
 
     /// Manually restrict this user's messages to known safe phrases for a duration. Overwrites any
@@ -501,7 +443,7 @@ impl Context {
     /// Manually restrict this user's messages to known safe phrases until an instant. Overwrites any
     /// previous manual restriction. Passing an instant in the past will therefore un-restrict.
     pub fn restrict_until(&mut self, instant: Instant) {
-        self.only_safe_until = Some(Time(instant));
+        self.only_safe_until = Some(instant);
     }
 
     /// Call if another user "reports" this user's message(s). The function of reports is for
@@ -516,9 +458,8 @@ impl Context {
         self.reports as usize
     }
 
-    /// Clear suspicion, reports, inappropriate counter, and automatic mutes (not manual mute or rate limit).
+    /// Clear suspicion and reports, and automatic mutes (not manual mute or rate limit).
     pub fn exonerate(&mut self) {
-        self.total_inappropriate = 0;
         self.suspicion = 0;
         self.reports = 0;
         self.only_safe_until = None;
@@ -544,16 +485,11 @@ impl Default for Context {
     }
 }
 
-/// Communicates why a message was blocked as opposed to merely censored.
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[non_exhaustive]
-#[cfg_attr(doc, doc(cfg(feature = "context")))]
 pub enum BlockReason {
     /// The particular message was *severely* inappropriate, more specifically, `Type`.
     Inappropriate(Type),
-    #[cfg(feature = "width")]
-    /// There was an unbroken part of the string of this length, exceeding the limit.
-    Unbroken(usize),
     /// Recent messages were generally inappropriate, and this message isn't on the safe list.
     /// Alternatively, if targeted is false, safe mode was configured globally.
     /// Try again after `Duration`.
@@ -577,19 +513,7 @@ impl BlockReason {
     /// default warning to send to the user.
     pub fn generic_str(self) -> &'static str {
         match self {
-            Self::Inappropriate(typ) => {
-                if typ.is(Type::OFFENSIVE) {
-                    "Your message was held for being highly offensive"
-                } else if typ.is(Type::SEXUAL) {
-                    "Your message was held for being overly sexual"
-                } else if typ.is(Type::MEAN) {
-                    "Your message was held for being overly mean"
-                } else {
-                    "Your message was held for severe profanity"
-                }
-            }
-            #[cfg(feature = "width")]
-            Self::Unbroken(_) => "Part of your message is too wide to display",
+            Self::Inappropriate(_) => "Your message was held for severe profanity",
             Self::Unsafe { .. } => "You have been temporarily restricted due to profanity/spam",
             Self::Repetitious(_) => "Your message was too similar to recent messages",
             Self::Spam(_) => "You have been temporarily muted due to excessive frequency",
@@ -608,6 +532,15 @@ impl BlockReason {
     /// muted for).
     pub fn contextual_string(self) -> String {
         match self {
+            Self::Inappropriate(typ) => String::from(if typ.is(Type::OFFENSIVE) {
+                "Your message was held for being highly offensive"
+            } else if typ.is(Type::SEXUAL) {
+                "Your message was held for being overly sexual"
+            } else if typ.is(Type::MEAN) {
+                "Your message was held for being overly mean"
+            } else {
+                "Your message was held for severe profanity"
+            }),
             Self::Unsafe {
                 remaining,
                 targeted: true,
@@ -627,7 +560,7 @@ impl BlockReason {
                 FormattedDuration(dur)
             ),
             Self::Muted(dur) => format!("You have been muted for {}", FormattedDuration(dur)),
-            _ => self.generic_str().to_owned(),
+            _ => String::from(self.generic_str()),
         }
     }
 }
@@ -643,60 +576,6 @@ impl Display for FormattedDuration {
         } else {
             write!(f, "{}s", self.0.as_secs().max(1))
         }
-    }
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-struct Time(#[cfg_attr(feature = "serde", serde(with = "approx_instant"))] Instant);
-
-impl Debug for Time {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        Debug::fmt(&self.0, f)
-    }
-}
-
-#[cfg(feature = "serde")]
-mod approx_instant {
-    use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
-    use std::time::{Duration, Instant, SystemTime};
-
-    pub fn serialize<S>(instant: &Instant, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let system_now = SystemTime::now();
-        let instant_now = Instant::now();
-        let approx = if instant_now > *instant {
-            system_now - (instant_now - *instant)
-        } else {
-            system_now + (*instant - instant_now)
-        };
-        let millis = approx
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        millis.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Instant, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let millis = u64::deserialize(deserializer)?;
-        let system_now = SystemTime::now();
-        let de = SystemTime::UNIX_EPOCH
-            .checked_add(Duration::from_millis(millis))
-            .unwrap_or(system_now);
-        let instant_now = Instant::now();
-        let approx = if system_now > de {
-            let duration = system_now.duration_since(de).map_err(Error::custom)?;
-            instant_now - duration
-        } else {
-            let duration = de.duration_since(system_now).map_err(Error::custom)?;
-            instant_now + duration
-        };
-        Ok(approx)
     }
 }
 
@@ -879,17 +758,11 @@ mod tests {
     #[test]
     #[cfg(feature = "width")]
     fn character_limit() {
-        use crate::{
-            context::ContextWordBreakOptions, BlockReason, Context, ContextProcessingOptions,
-        };
+        use crate::{BlockReason, Context, ContextProcessingOptions};
         let mut ctx = Context::new();
 
         let opts = ContextProcessingOptions {
             character_limit: Some(NonZeroUsize::new(5).unwrap()),
-            word_break: Some(ContextWordBreakOptions {
-                word_break: crate::width::WordBreak::BreakAll,
-                limit: NonZeroUsize::new(5).unwrap(),
-            }),
             ..Default::default()
         };
 
@@ -898,44 +771,10 @@ mod tests {
             Ok(String::from("abcde"))
         );
 
+        #[cfg(feature = "width")]
         assert_eq!(
             ctx.process_with_options(String::from("a﷽"), &opts),
             Ok(String::from("a"))
         );
-
-        let opts = ContextProcessingOptions {
-            character_limit: Some(NonZeroUsize::new(20).unwrap()),
-            word_break: Some(ContextWordBreakOptions {
-                word_break: crate::width::WordBreak::BreakAll,
-                limit: NonZeroUsize::new(5).unwrap(),
-            }),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            ctx.process_with_options("abc ௌௌௌௌ def".to_owned(), &opts),
-            Err(BlockReason::Unbroken(10))
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "serde")]
-    fn serde() {
-        use std::time::SystemTime;
-
-        let mut ctx = crate::Context::default();
-        ctx.process("foo".to_string()).unwrap();
-        ctx.restrict_for(Duration::from_secs(1000));
-        println!("{}", serde_json::to_string(&ctx).unwrap());
-        let json = serde_json::to_value(&ctx).unwrap();
-        let only_safe_until = &json["only_safe_until"];
-        let unix = only_safe_until.as_i64().unwrap();
-        assert!(
-            unix > 1000
-                + SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64
-        )
     }
 }

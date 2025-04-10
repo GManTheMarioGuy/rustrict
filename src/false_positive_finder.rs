@@ -1,4 +1,5 @@
 use indicatif::ProgressBar;
+use itertools::Itertools;
 use lazy_static::lazy_static;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
@@ -10,26 +11,21 @@ use std::sync::Mutex;
 
 lazy_static! {
     static ref DICTIONARY: HashSet<&'static str> = include_str!("dictionary.txt")
-        .lines()
+        .split("\r\n")
         .chain(include_str!("dictionary_extra.txt").split('\n'))
-        .chain(include_str!("dictionary_common.txt").lines())
-        .chain(include_str!("dictionary_common_valid_short.txt").lines())
         .filter(|&word| !word.is_empty() && !is_blacklisted(word))
         .collect();
     static ref VALID_SHORT: HashSet<&'static str> =
         include_str!("dictionary_common_valid_short.txt")
-            .lines()
+            .split("\n")
             .filter(|l| !l.is_empty())
             .collect();
     static ref CONCAT_DICTIONARY: HashSet<&'static str> = include_str!("dictionary_common.txt")
         .lines()
-        .chain(include_str!("dictionary_common_valid_short.txt")
-        .lines())
         .filter(|&w| {
-            let long_enough = w.len() > 3 || VALID_SHORT.contains(w);
-            let allowed = !is_blacklisted(w);
-            long_enough
-                && allowed
+            (w.len() > 3 || VALID_SHORT.contains(w))
+                && !is_blacklisted(w)
+                && is_ignore_fp(w.chars(), true).0 == 0
         })
         .collect();
     static ref PROFANITY: Vec<&'static str> = include_str!("profanity.csv")
@@ -41,14 +37,13 @@ lazy_static! {
         .lines()
         .skip(1)
         // must trim starting spaces, as they don't count when comparing to blacklist.
-        .map(|l| l[..l.find(',').expect(l)].trim_start_matches(' '))
-        .map(|w| Regex::new(&regex::escape(w)).unwrap())
+        .map(|l| l[..l.find(',').unwrap()].trim_start_matches(' '))
         .chain(
             include_str!("dictionary_blacklist.txt")
                 .split("\n")
                 .filter(|l| !l.is_empty())
-                .map(|l| Regex::new(l).unwrap())
         )
+        .map(|l| Regex::new(&l.replace("\\", "\\\\")).unwrap())
         .collect();
 }
 
@@ -67,54 +62,47 @@ pub fn is_ignore_fp<C: Iterator<Item = char>>(text: C, start_separate: bool) -> 
     }
 }
 
-fn maybe_false_positive<C: Iterator<Item = char> + Clone>(
-    word: C,
-    baseline_match_ptr: usize,
-) -> Option<String> {
+fn maybe_false_positive<C: Iterator<Item = char> + Clone>(word: C) -> Option<String> {
     let (baseline, baseline_first_match_ptr) = is_ignore_fp(word.clone(), true);
-    if baseline > 0 && baseline_first_match_ptr != baseline_match_ptr {
+    if baseline > 0 {
         let word: String = word.collect();
         let word = &word[..];
 
         if is_blacklisted(word) {
             return None;
         }
-
+        let index_range = 0..=word.len();
         let mut shortest_subslice = word;
-        // TODO: Cannot always remove prefix, because false positive wont take effect if starts
-        // after the profanity in question. For example, "to helicopter" -> "heli"
-        for len in 1..word.len() {
-            // break
-            // len = 2
-            // word.len() - len = 3
-            // br    start = 0
-            //  re   start = 1
-            //   ea  start = 2
-            //    ak start = 3 end = 5
-            for start in 0..=word.len() - len {
-                let end = start + len;
-                let sub_slice = &word[start..end];
+        for perm in index_range.permutations(2) {
+            // TODO: Cannot always remove prefix, because false positive wont take effect if starts
+            // after the profanity in question. For example, "to helicopter" -> "heli"
+            let start = perm[0];
+            let end = perm[1];
 
-                if sub_slice.len() >= shortest_subslice.len() {
-                    continue;
-                }
+            if start >= end {
+                continue;
+            }
 
-                let valid = sub_slice.split(' ').all(|w| DICTIONARY.contains(w));
+            let sub_slice = &word[start..end];
 
-                if !valid {
-                    continue;
-                }
+            if sub_slice.len() >= shortest_subslice.len() {
+                continue;
+            }
 
-                let (subslice_matches, first_match_ptr) = is_ignore_fp(
-                    sub_slice.chars(),
-                    start == 0 || word.as_bytes()[start - 1] == b' ',
-                );
-                if subslice_matches >= baseline
-                    && first_match_ptr == baseline_first_match_ptr
-                    && !is_blacklisted(sub_slice)
-                {
-                    shortest_subslice = sub_slice;
-                }
+            let valid = if sub_slice.contains(' ') {
+                let mut split = sub_slice.split(' ');
+                split.all(|w| DICTIONARY.contains(w))
+            } else {
+                DICTIONARY.contains(sub_slice)
+            };
+
+            let (subslice_matches, first_match_ptr) = is_ignore_fp(sub_slice.chars(), start == 0);
+            if valid
+                && subslice_matches >= baseline
+                && first_match_ptr == baseline_first_match_ptr
+                && !is_blacklisted(sub_slice)
+            {
+                shortest_subslice = sub_slice;
             }
         }
         return Some(String::from(shortest_subslice));
@@ -135,57 +123,28 @@ fn main() {
         .par_iter()
         .filter_map(|&word| {
             progress.inc(1);
-            maybe_false_positive(word.chars(), 0)
+            maybe_false_positive(word.chars())
         })
         .collect();
 
-    progress.finish();
-
-    let progress = ProgressBar::new(CONCAT_DICTIONARY.len() as u64);
+    let progress = ProgressBar::new((CONCAT_DICTIONARY.len() as u64).pow(2));
     progress.eta();
 
     let false_positives = Mutex::new(false_positives);
 
     CONCAT_DICTIONARY.par_iter().for_each(|word1| {
-        let word1_ptr = is_ignore_fp(word1.chars(), true).1;
         for word2 in CONCAT_DICTIONARY.iter() {
-            let word2_ptr = is_ignore_fp(word2.chars(), true).1;
-            if let Some(false_positive) = maybe_false_positive(
-                word1
-                    .chars()
-                    .chain(std::iter::once(' '))
-                    .chain(word2.chars()),
-                word1_ptr ^ word2_ptr,
-            ) {
+            progress.inc(1);
+            if let Some(false_positive) =
+                maybe_false_positive(word1.chars().chain(" ".chars()).chain(word2.chars()))
+            {
                 //println!("fp: {}", false_positive);
                 false_positives.lock().unwrap().insert(false_positive);
             }
         }
-        progress.inc(1);
     });
 
-    progress.finish();
-
-    let mut false_positives = false_positives.into_inner().unwrap();
-
-    let clone = false_positives.clone();
-    false_positives.retain(|false_positive| {
-        let baseline = is_ignore_fp(false_positive.chars(), true);
-        for clone in &clone {
-            if false_positive.len() != clone.len()
-                && (false_positive.starts_with(clone) || false_positive.ends_with(clone))
-            {
-                let shorter = is_ignore_fp(clone.chars(), true);
-                if baseline == shorter {
-                    println!("filter out {false_positive} in favor of {clone}");
-                    return false;
-                }
-            }
-        }
-        true
-    });
-
-    let mut sorted: Vec<_> = false_positives.into_iter().collect();
+    let mut sorted: Vec<_> = false_positives.into_inner().unwrap().into_iter().collect();
     sorted.sort();
 
     fs::write("src/false_positives.txt", sorted.join("\n")).unwrap();

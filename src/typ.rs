@@ -3,7 +3,6 @@ use std::fmt::Debug;
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
 
 bitflags! {
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     struct TypeRepr: u32 {
         const PROFANE   = 0b0_000_000_000_000_000_111;
         const OFFENSIVE = 0b0_000_000_000_000_111_000;
@@ -33,7 +32,6 @@ bitflags! {
 /// For example, the following means profane or at-least moderately mean:
 /// `Type::PROFANE | (Type::MEAN & Type::MODERATE_OR_HIGHER)`
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Type(TypeRepr);
 
 const SEVERE_WEIGHT: i8 = 3;
@@ -63,13 +61,13 @@ impl Type {
     /// Recommended to enforce this on users who repeatedly evade the filter.
     pub const SAFE: Self = Self(TypeRepr::SAFE);
 
-    /// Not that bad. (low severity and/or low confidence)
+    /// Not that bad.
     pub const MILD: Self = Self(TypeRepr::MILD);
 
-    /// Bad. (moderate severity and/or moderate confidence)
+    /// Bad.
     pub const MODERATE: Self = Self(TypeRepr::MODERATE);
 
-    /// Cover your eyes! (high severity and/or high confidence)
+    /// Cover your eyes!
     pub const SEVERE: Self = Self(TypeRepr::SEVERE);
 
     /// Any level; `Type::MILD`, `Type::MODERATE`, or `Type::SEVERE`.
@@ -78,8 +76,7 @@ impl Type {
     /// Any level in excess of `Type::MILD`.
     pub const MODERATE_OR_HIGHER: Self = Self(TypeRepr::MODERATE_OR_HIGHER);
 
-    /// Inappropriate for general audiences (the default `Type`, meaning profane,
-    /// offensive, sexual, or severely mean).
+    /// The default `Type`, meaning profane, offensive, sexual, or severely mean.
     pub const INAPPROPRIATE: Self = Self(TypeRepr::INAPPROPRIATE);
 
     /// Any type of detection (except SAFE). This will be expanded to cover all future types.
@@ -206,7 +203,7 @@ impl Not for Type {
     }
 }
 
-// Note: Can't impl directly on TypeRepr due to https://github.com/bitflags/bitflags/issues/218
+/// Note: Can't impl directly on TypeRepr due to https://github.com/bitflags/bitflags/issues/218
 impl Debug for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         fn description(bits: u32) -> &'static str {

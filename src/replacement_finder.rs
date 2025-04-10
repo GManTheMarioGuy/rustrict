@@ -83,9 +83,8 @@ fn main() {
     // Extra confusables.
     include_str!("replacements_extra.csv")
         .split("\n")
-        .enumerate()
-        .filter(|(_, line)| !line.is_empty())
-        .map(|(n, line)| {
+        .filter(|line| !line.is_empty())
+        .map(|line| {
             let comma = line.find(",").unwrap();
             let before_comma = &line[..comma];
             let c = if before_comma.chars().count() == 1 {
@@ -93,7 +92,7 @@ fn main() {
             } else {
                 let escape = before_comma
                     .strip_prefix("\\u{")
-                    .expect(&format!("line {}", n + 1))
+                    .expect(before_comma)
                     .strip_suffix("}")
                     .unwrap();
                 let escape_int = u32::from_str_radix(escape, 16).unwrap();
@@ -101,8 +100,8 @@ fn main() {
                 char::from_u32(escape_int).unwrap()
             };
 
-            use finl_unicode::categories::CharacterCategories;
             use unicode_normalization::UnicodeNormalization;
+            use finl_unicode::categories::{CharacterCategories};
             let c_string = String::from(c);
             let c_string_2 = c_string
                 .nfd()
@@ -113,12 +112,9 @@ fn main() {
             if c_string != c_string_2 {
                 println!("Warning (Mn): {c_string} -> {c_string_2}");
             }
-            assert_eq!(c_string_2.chars().count(), 1, "line {}", n + 1);
+            assert_eq!(c_string_2.chars().count(), 1);
 
-            (
-                c_string_2.chars().next().unwrap(),
-                String::from(&line[comma + 1..]),
-            )
+            (c_string_2.chars().next().unwrap(), String::from(&line[comma + 1..]))
         })
         .for_each(&mut append_replacement);
 

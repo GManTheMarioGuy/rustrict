@@ -1,4 +1,3 @@
-use crate::is_whitespace;
 use std::str::from_utf8;
 
 const MODE_WIDTH: u8 = 10;
@@ -48,7 +47,6 @@ lazy_static::lazy_static! {
 /// to know if your user's text is 10.3X longer per character than you might have expected?).
 ///
 /// Precision is not necessarily 1 milli-`m` (currently, it is 100 milli-`m`'s).
-#[cfg_attr(doc, doc(cfg(feature = "width")))]
 pub fn width(c: char) -> usize {
     let width = match WIDTHS.binary_search_by_key(&c, |&(c, _)| c) {
         Ok(idx) => WIDTHS[idx].1,
@@ -61,64 +59,8 @@ pub fn width(c: char) -> usize {
 /// Convenience method for getting the width, in `m`'s, of an entire string.
 ///
 /// Warning: If the width overflows, the result is undefined (e.g. panic or overflow).
-#[cfg_attr(doc, doc(cfg(feature = "width")))]
 pub fn width_str(s: &str) -> usize {
     s.chars().map(|c| width(c) / 100).sum::<usize>() / 10
-}
-
-/// How text is expected to be displayed.
-///
-/// Eventually, `BreakWord` will be supported.
-#[derive(Copy, Clone, Debug)]
-#[non_exhaustive]
-pub enum WordBreak {
-    // TODO: BreakWord
-    /// Same as CSS's `word-break: break-all;`.
-    BreakAll,
-}
-
-/// Like `width_str` but computes the width of the max unbroken (no line break) part of the string.
-///
-/// In certain cases, not even CSS's `word-break: break-all;` (or equivalents) will be able to
-/// break a string, so it's good to know how long the lines might get.
-///
-/// For example, try selecting the following unbroken part: ௌௌௌௌ
-pub fn width_str_max_unbroken(s: &str, _word_break: WordBreak) -> usize {
-    let mut start = 0;
-    break_all_linebreaks(&s)
-        .map(|p| {
-            let unbroken = &s[start..p];
-            start = p;
-            width_str(unbroken.trim_end_matches(is_whitespace))
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-// TODO unicode-linebreak = { version = "0.1.5", optional = true }
-
-fn break_all_linebreaks(s: &str) -> impl Iterator<Item = usize> + '_ {
-    use finl_unicode::categories::{CharacterCategories, MinorCategory};
-
-    use itertools::Itertools;
-    s.char_indices()
-        .tuple_windows()
-        .filter_map(|((_, c1), (p, c2))| {
-            let c1 = c1.get_minor_category();
-            let c2 = c2.get_minor_category();
-            let break_all = !matches!(c1, MinorCategory::Mn | MinorCategory::Mc)
-                && !matches!(c2, MinorCategory::Mn | MinorCategory::Mc);
-            if break_all
-                || [c1, c2]
-                    .into_iter()
-                    .any(|c| matches!(c, MinorCategory::Zs | MinorCategory::Zl))
-            {
-                Some(p)
-            } else {
-                None
-            }
-        })
-        .chain(std::iter::once(s.len()))
 }
 
 /// Trims a string to a maximum number of `m`'s. A budget of 5 would allow five m, or more narrower
@@ -137,8 +79,8 @@ pub fn trim_to_width(s: &str, mut budget: usize) -> &str {
 
 #[cfg(test)]
 mod test {
-    use crate::width::{trim_to_width, width_str, WordBreak};
-    use crate::{width, width_str_max_unbroken, CensorStr};
+    use crate::width;
+    use crate::width::{trim_to_width, width_str};
     use serial_test::serial;
 
     /*
@@ -149,23 +91,6 @@ mod test {
      */
 
     #[test]
-    pub fn unbroken() {
-        let tests = [
-            ("", 0),
-            ("m", 1),
-            ("mm", 1),
-            ("m m", 1),
-            ("m     m", 1),
-            ("mm m", 1),
-            ("m mm", 1),
-            ("m;m", 1),
-        ];
-        for (s, w) in tests {
-            assert_eq!(width_str_max_unbroken(s, WordBreak::BreakAll), w, "{s} {w}");
-        }
-    }
-
-    #[test]
     pub fn m() {
         assert_eq!(width('m'), 1000);
     }
@@ -174,35 +99,6 @@ mod test {
     pub fn fdfd() {
         // https://commons.wikimedia.org/wiki/File:Lateef_unicode_U%2BFDFD_2020-03-09_122519.png
         assert_eq!(width('\u{FDFD}'), 10300)
-    }
-
-    #[test]
-    pub fn three_em_dash() {
-        assert!(width('⸻') >= 2500);
-    }
-
-    #[test]
-    pub fn lattice() {
-        assert!(width('𒐫') >= 3000);
-    }
-
-    #[test]
-    pub fn cuneiform() {
-        assert!(width('𒈙') >= 3000);
-    }
-
-    #[test]
-    pub fn javanese() {
-        assert!(width('꧅') >= 1500);
-    }
-
-    #[test]
-    pub fn tamil() {
-        assert_eq!(
-            width_str_max_unbroken("abc ௌௌௌௌ def", WordBreak::BreakAll),
-            10
-        );
-        assert_eq!(width_str_max_unbroken("abc ௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌௌ", WordBreak::BreakAll), 345);
     }
 
     #[test]
@@ -219,12 +115,6 @@ mod test {
     pub fn string() {
         //assert_eq!(width_str("abc‱Ǆဪ"), 7);
         assert_eq!(width_str("abc‱Ǆဪ"), 8);
-    }
-
-    #[test]
-    #[serial]
-    pub fn tall() {
-        assert_eq!("a꧁a".censor(), "aa");
     }
 
     #[test]
