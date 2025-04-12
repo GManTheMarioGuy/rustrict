@@ -1,8 +1,5 @@
 #![cfg_attr(test, feature(test))]
-#![cfg_attr(doc, feature(doc_cfg))]
 
-#[cfg(feature = "censor")]
-pub(crate) mod banned;
 #[cfg(feature = "censor")]
 pub(crate) mod buffer_proxy_iterator;
 #[cfg(feature = "censor")]
@@ -12,8 +9,6 @@ pub(crate) mod feature_cell;
 #[cfg(feature = "censor")]
 pub(crate) mod mtch;
 #[cfg(feature = "censor")]
-pub(crate) mod replacements;
-#[cfg(feature = "censor")]
 pub(crate) mod trie;
 #[cfg(feature = "censor")]
 pub(crate) mod typ;
@@ -21,20 +16,11 @@ pub(crate) mod typ;
 #[cfg(feature = "context")]
 pub(crate) mod context;
 
-#[cfg(feature = "pii")]
-mod pii;
 #[cfg(feature = "width")]
 pub(crate) mod width;
 
-#[cfg(feature = "censor")]
-pub use banned::Banned;
-#[cfg(feature = "censor")]
-pub use replacements::Replacements;
-#[cfg(feature = "censor")]
-pub use trie::Trie;
-
 #[cfg(feature = "width")]
-pub use width::{trim_to_width, width, width_str, width_str_max_unbroken, WordBreak};
+pub use width::{trim_to_width, width, width_str};
 
 #[cfg(feature = "censor")]
 pub use typ::Type;
@@ -50,19 +36,13 @@ pub(crate) type Map<K, V> = rustc_hash::FxHashMap<K, V>;
 pub(crate) type Set<V> = rustc_hash::FxHashSet<V>;
 
 #[cfg(feature = "customize")]
-#[allow(deprecated)]
 pub use censor::add_word;
 
-#[cfg(all(feature = "context", feature = "width"))]
-pub use context::ContextWordBreakOptions;
 #[cfg(feature = "context")]
 pub use context::{
     BlockReason, Context, ContextProcessingOptions, ContextRateLimitOptions,
     ContextRepetitionLimitOptions,
 };
-
-#[cfg(feature = "pii")]
-pub use pii::censor_and_analyze_pii;
 
 /// Trims whitespace characters from both ends of a string, according to the definition of
 /// `crate::is_whitespace`.

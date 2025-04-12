@@ -58,7 +58,6 @@ up ahead
 run away
 so long
 peace
-oof
 its been so long
 yawn
 wut
@@ -113,10 +112,6 @@ follow me
 join
 join me
 join my team
-use team chat
-team chat
-switch to team chat
-go to team chat
 join my fleet
 join my clan
 stop
@@ -138,7 +133,6 @@ false
 gtg
 facts
 brb
-bro
 omg
 afk
 gg
@@ -150,7 +144,6 @@ lmao
 hehe
 haha
 hahaha
-hablo espanol
 ha
 very funny
 xd

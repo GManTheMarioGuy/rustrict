@@ -1,4 +1,4 @@
-use rustrict::{Censor, Type};
+use rustrict::Censor;
 use std::env::args;
 
 pub fn main() {
@@ -7,22 +7,18 @@ pub fn main() {
     trace(&input, false);
     //trace(&input, true);
 
-    use finl_unicode::categories::CharacterCategories;
     use unicode_normalization::UnicodeNormalization;
-    println!(
-        "Without diacritics: {}",
-        input
-            .nfd()
-            .filter(|c| !c.is_mark_nonspacing())
-            .nfc()
-            .collect::<String>()
-    );
+    use finl_unicode::categories::{CharacterCategories};
+    println!("Without diacritics: {}", input
+        .nfd()
+        .filter(|c| !c.is_mark_nonspacing())
+        .nfc()
+        .collect::<String>());
 }
 
 pub fn trace(s: &str, ignore_fp: bool) {
     let mut censor = Censor::from_str(s);
     censor.with_ignore_false_positives(ignore_fp);
-    censor.with_censor_threshold(Type::ANY);
     let (censored, analysis) = censor.censor_and_analyze();
     println!(
         "ignore_fp={}, \"{}\" -> \"{}\" ({:?} with {} matches and {} matching characters)",
@@ -31,6 +27,6 @@ pub fn trace(s: &str, ignore_fp: bool) {
         censored,
         analysis,
         censor.total_matches(),
-        censor.total_match_characters(),
+        censor.total_match_characters()
     );
 }

@@ -1,14 +1,6 @@
 # rustrict
 
-[![Documentation](https://docs.rs/rustrict/badge.svg)](https://docs.rs/rustrict)
-[![crates.io](https://img.shields.io/crates/v/rustrict.svg)](https://crates.io/crates/rustrict)
-[![Build](https://github.com/finnbear/rustrict/actions/workflows/build.yml/badge.svg)](https://github.com/finnbear/rustrict/actions/workflows/build.yml) 
-[![Test Page](https://img.shields.io/badge/Test-page-green)](https://finnbear.github.io/rustrict/)
-
-
-`rustrict` is a profanity filter for Rust.
-
-<sup>Disclaimer: Multiple source files (`.txt`, `.csv`, `.rs` test cases) contain profanity. Viewer discretion is advised.</sup>
+`rustrict` is a sophisticated profanity filter for Rust. 
 
 ## Features
 
@@ -38,12 +30,12 @@
 - Performant
   - O(n) analysis and censoring
   - No `regex` (uses custom trie)
-  - 3 MB/s in `release` mode
+  - 4 MB/s in `release` mode
   - 100 KB/s in `debug` mode
 
 ## Limitations
 
-- Mostly English/emoji
+- Mostly English/emoji only
 - Censoring removes most diacritics (accents)
 - Does not detect right-to-left profanity while analyzing, so...
 - Censoring forces Unicode to be left-to-right
@@ -132,7 +124,8 @@ If you want to add custom profanities or safe words, enable the `customize` feat
 }
 ```
 
-If your use-case is chat moderation, and you store data on a per-user basis, you can use `rustrict::Context` as a reference implementation:
+But wait, there's more! If your use-case is chat moderation, and you can store data on a per-user basis, you
+might benefit from the `context` feature.
 
 ```rust
 #[cfg(feature = "context")]
@@ -177,23 +170,16 @@ is used as a dataset. Positive accuracy is the percentage of profanity detected 
 
 | Crate | Accuracy | Positive Accuracy | Negative Accuracy | Time |
 |-------|----------|-------------------|-------------------|------|
-| [rustrict](https://crates.io/crates/rustrict) | 80.00%   | 93.98%            | 76.52%            | 9s   |
+| [rustrict](https://crates.io/crates/rustrict) | 89.72%   | 92.29%            | 89.07%            | 8s   |
 | [censor](https://crates.io/crates/censor) | 76.16%   | 72.76%            | 77.01%            | 23s  |
-| [stfu](https://crates.io/crates/stfu) | 91.74% | 77.69% | 95.25% | 45s |
-| [profane-rs](https://crates.io/crates/profane-rs) | 80.47% | 73.79% | 82.14% | 52s |
 
 ## Development
 
 [![Build](https://github.com/finnbear/rustrict/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/finnbear/rustrict/actions/workflows/build.yml)
 
-If you make an adjustment that would affect false positives, such as adding profanity,
-you will need to run `false_positive_finder`:
-1. Run `make downloads` to download the required word lists and dictionaries
-2. Run `make false_positives` to automatically find false positives
-
-If you modify `replacements_extra.csv`, run `make replacements` to rebuild `replacements.csv`.
-
-Finally, run `make test` for a full test or `make test_debug` for a fast test.
+If you make an adjustment that would affect false positives, you will need to run `false_positive_finder`:
+1. Run `./downloads.sh` to get the required word lists.
+2. Run `cargo run --bin false_positive_finder --release --features="find_false_positives"`
 
 ## License
 
